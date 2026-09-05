@@ -45,12 +45,14 @@ def create_portfolio_manager(llm):
 
 ---
 
-**Rating Scale** (use exactly one):
-- **Buy**: Strong conviction to enter or add to position
-- **Overweight**: Favorable outlook, gradually increase exposure
-- **Hold**: Maintain current position, no action needed
-- **Underweight**: Reduce exposure, take partial profits
-- **Sell**: Exit position or avoid entry
+**Rating Scale** (use exactly one) — each tier maps to a concrete position outcome, not just a mood:
+- **Buy**: Enter or add to the position at full size today. There is no later top-up — Buy and Overweight execute identically, so reserve Buy for when the case is strong enough to act on immediately.
+- **Overweight**: Also enters or adds to the position at full size today (same mechanical outcome as Buy) — use this when full exposure is warranted but the case is constructive rather than urgent or emphatic.
+- **Hold**: Maintain current position, no action needed.
+- **Underweight**: Trims the current position to half its size — for a deteriorating-but-not-abandon view, not just "somewhat cautious."
+- **Sell**: Exits the position completely.
+
+Because Buy and Overweight size identically, pick between them on how emphatic the case is, not on how much exposure you want.
 
 **Context:**
 - Research Manager's investment plan: **{research_plan}**

@@ -28,14 +28,14 @@ def create_research_manager(llm):
 
 ---
 
-**Rating Scale** (use exactly one):
-- **Buy**: Strong conviction in the bull thesis; recommend taking or growing the position
-- **Overweight**: Constructive view; recommend gradually increasing exposure
-- **Hold**: Balanced view; recommend maintaining the current position
-- **Underweight**: Cautious view; recommend trimming exposure
-- **Sell**: Strong conviction in the bear thesis; recommend exiting or avoiding the position
+**Rating Scale** (use exactly one) — each tier maps to a concrete position outcome, not just a mood:
+- **Buy**: Enter or add to the position at full size today. There is no later top-up — Buy and Overweight execute identically, so reserve Buy for when the bull case is strong enough to act on immediately.
+- **Overweight**: Also enters or adds to the position at full size today (the same mechanical outcome as Buy) — choose this when full exposure is warranted but the case is constructive rather than urgent or emphatic.
+- **Hold**: Maintain the current position; no trade is placed.
+- **Underweight**: Trims the current position to half its size — pick this for a deteriorating-but-not-abandon view, not as a synonym for "somewhat cautious."
+- **Sell**: Exits the position completely.
 
-Commit to a clear stance whenever the debate's strongest arguments warrant one; reserve Hold for situations where the evidence on both sides is genuinely balanced.
+Commit to a clear stance whenever the debate's strongest arguments warrant one; reserve Hold for situations where the evidence on both sides is genuinely balanced. Because Buy and Overweight size identically, choose between them on how emphatic the case is, not on how much exposure you want — exposure is the same either way.
 
 ---
 

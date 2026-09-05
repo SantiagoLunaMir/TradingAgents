@@ -82,9 +82,13 @@ class ResearchPlan(BaseModel):
     recommendation: PortfolioRating = Field(
         description=(
             "The investment recommendation. Exactly one of Buy / Overweight / "
-            "Hold / Underweight / Sell. Reserve Hold for situations where the "
-            "evidence on both sides is genuinely balanced; otherwise commit to "
-            "the side with the stronger arguments."
+            "Hold / Underweight / Sell. Buy and Overweight both enter/add at "
+            "full size (no later top-up) — pick Buy only when the case is "
+            "strong enough to act on immediately, Overweight when full "
+            "exposure is warranted but the case is constructive rather than "
+            "urgent. Underweight trims the position to half; Sell exits it "
+            "completely. Reserve Hold for situations where the evidence on "
+            "both sides is genuinely balanced."
         ),
     )
     rationale: str = Field(
@@ -197,7 +201,10 @@ class PortfolioDecision(BaseModel):
     rating: PortfolioRating = Field(
         description=(
             "The final position rating. Exactly one of Buy / Overweight / Hold / "
-            "Underweight / Sell, picked based on the analysts' debate."
+            "Underweight / Sell, picked based on the analysts' debate. Buy and "
+            "Overweight both enter/add at full size (no later top-up) — Buy for "
+            "an urgent/emphatic case, Overweight for a constructive one. "
+            "Underweight trims the position to half; Sell exits it completely."
         ),
     )
     executive_summary: str = Field(
