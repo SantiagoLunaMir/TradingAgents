@@ -256,8 +256,9 @@ class TradingAgentsGraph:
 
         ``benchmark`` is the index used as the alpha baseline (resolved by the
         caller via ``_resolve_benchmark``). Returns ``(raw_return, alpha_return,
-        actual_holding_days)`` or ``(None, None, None)`` if price data is
-        unavailable (too recent, delisted, or network error).
+        holding_days)`` or ``(None, None, None)`` when the outcome cannot be
+        settled yet: the full holding window has not traded (#1169), or the
+        symbol is delisted or unreachable.
         """
         from tradingagents.dataflows.symbol_utils import normalize_symbol
 
@@ -272,20 +273,22 @@ class TradingAgentsGraph:
             stock = yf.Ticker(normalize_symbol(ticker)).history(start=trade_date, end=end_str)
             bench = yf.Ticker(benchmark).history(start=trade_date, end=end_str)
 
-            if len(stock) < 2 or len(bench) < 2:
+            # Require the full holding window in both series. A rerun before it
+            # has traded leaves the entry pending to retry next run, rather than
+            # settling on a premature partial return (#1169).
+            if len(stock) <= holding_days or len(bench) <= holding_days:
                 return None, None, None
 
-            actual_days = min(holding_days, len(stock) - 1, len(bench) - 1)
             raw = float(
-                (stock["Close"].iloc[actual_days] - stock["Close"].iloc[0])
+                (stock["Close"].iloc[holding_days] - stock["Close"].iloc[0])
                 / stock["Close"].iloc[0]
             )
             bench_ret = float(
-                (bench["Close"].iloc[actual_days] - bench["Close"].iloc[0])
+                (bench["Close"].iloc[holding_days] - bench["Close"].iloc[0])
                 / bench["Close"].iloc[0]
             )
             alpha = raw - bench_ret
-            return raw, alpha, actual_days
+            return raw, alpha, holding_days
         except Exception as e:
             logger.warning(
                 "Could not resolve outcome for %s on %s vs %s (will retry next run): %s",
