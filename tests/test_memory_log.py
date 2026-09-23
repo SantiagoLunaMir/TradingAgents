@@ -553,6 +553,87 @@ class TestDeferredReflection:
             result = TradingAgentsGraph._fetch_returns(mock_graph, "NVDA", "2026-01-05")
         assert result == (None, None, None)
 
+    # configurable reflection horizon (config["memory_holding_days"])
+
+    def test_fetch_returns_uses_the_configured_horizon(self):
+        """With memory_holding_days=20 the outcome is graded on the 20th session."""
+        stock_prices = [100.0 + i for i in range(21)]   # 21 rows: sessions 0..20
+        spy_prices = [400.0] * 21
+        mock_graph = MagicMock(spec=TradingAgentsGraph)
+        mock_graph.config = {"memory_holding_days": 20}
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            def _make_ticker(sym):
+                m = MagicMock()
+                m.history.return_value = _price_df(spy_prices if sym == "SPY" else stock_prices)
+                return m
+            mock_ticker_cls.side_effect = _make_ticker
+            raw, alpha, days = TradingAgentsGraph._fetch_returns(mock_graph, "NVDA", "2026-01-05")
+        assert days == 20
+        assert raw == pytest.approx(0.20)      # 100 -> 120
+        assert alpha == pytest.approx(0.20)    # flat benchmark
+
+    def test_fetch_returns_configured_horizon_stays_pending_until_it_trades(self):
+        """Six sessions settle a 5-day horizon but must not settle a 20-day one."""
+        mock_graph = MagicMock(spec=TradingAgentsGraph)
+        mock_graph.config = {"memory_holding_days": 20}
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            m = MagicMock()
+            m.history.return_value = _price_df([100.0 + i for i in range(6)])
+            mock_ticker_cls.return_value = m
+            result = TradingAgentsGraph._fetch_returns(mock_graph, "NVDA", "2026-01-05")
+        assert result == (None, None, None)
+
+    def test_fetch_returns_calendar_window_grows_with_the_horizon(self):
+        """A flat +7-day buffer holds ~19 sessions, so a 20-session window
+        could never fill; the requested end date must scale with the horizon."""
+        mock_graph = MagicMock(spec=TradingAgentsGraph)
+        mock_graph.config = {"memory_holding_days": 20}
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            m = MagicMock()
+            m.history.return_value = _price_df([100.0])
+            mock_ticker_cls.return_value = m
+            TradingAgentsGraph._fetch_returns(mock_graph, "NVDA", "2026-01-05")
+        end = m.history.call_args.kwargs["end"]
+        assert end == "2026-02-11"    # 2026-01-05 + int(20 * 1.5) + 7 = 37 days
+
+    def test_fetch_returns_explicit_argument_beats_config(self):
+        mock_graph = MagicMock(spec=TradingAgentsGraph)
+        mock_graph.config = {"memory_holding_days": 20}
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            m = MagicMock()
+            m.history.return_value = _price_df([100.0 + i for i in range(6)])
+            mock_ticker_cls.return_value = m
+            _, _, days = TradingAgentsGraph._fetch_returns(
+                mock_graph, "NVDA", "2026-01-05", holding_days=5)
+        assert days == 5
+
+    def test_default_config_keeps_upstream_reflection_behaviour(self):
+        from tradingagents.default_config import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["memory_holding_days"] == 5
+        assert DEFAULT_CONFIG["memory_same_ticker_entries"] == 5
+        assert DEFAULT_CONFIG["memory_cross_ticker_lessons"] == 3
+
+    def test_zero_cross_ticker_lessons_injects_none(self, tmp_path):
+        log = make_log(tmp_path)
+        _seed_completed(tmp_path, "AAPL", "2026-01-05", "Buy AAPL.", "Take a starter next time.")
+        _seed_completed(tmp_path, "NVDA", "2026-01-06", "Buy NVDA.", "Correct.")
+        ctx = log.get_past_context("NVDA", n_same=5, n_cross=0)
+        assert "Past analyses of NVDA" in ctx
+        assert "Recent cross-ticker lessons" not in ctx
+        assert "Take a starter" not in ctx
+
+    def test_run_graph_reads_injection_counts_from_config(self):
+        """_run_graph must pass the configured counts to get_past_context."""
+        mock_graph = MagicMock(spec=TradingAgentsGraph)
+        mock_graph.config = {"memory_same_ticker_entries": 4, "memory_cross_ticker_lessons": 0}
+        mock_graph.memory_log = MagicMock()
+        mock_graph.memory_log.get_past_context.side_effect = RuntimeError("stop here")
+        with pytest.raises(RuntimeError, match="stop here"):
+            TradingAgentsGraph._run_graph(mock_graph, "NVDA", "2026-01-05")
+        mock_graph.memory_log.get_past_context.assert_called_once_with(
+            "NVDA", n_same=4, n_cross=0)
+
     # TradingAgentsGraph._resolve_benchmark — picks index for alpha calc
 
     def test_resolve_benchmark_explicit_override(self):
