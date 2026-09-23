@@ -77,6 +77,15 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # the oldest resolved entries are pruned once this limit is exceeded.
     # Pending entries are never pruned. None disables rotation entirely.
     "memory_log_max_entries": None,
+    # Reflection layer. A pending decision is graded over this many trading
+    # sessions before its REFLECTION is written, and each new run injects the
+    # N most recent resolved same-ticker entries plus M most recent
+    # cross-ticker lessons into the Portfolio Manager prompt. The defaults
+    # keep upstream behaviour; a short horizon grades on noise, and
+    # cross-ticker lessons carry one week's market mood into every name.
+    "memory_holding_days": 5,
+    "memory_same_ticker_entries": 5,
+    "memory_cross_ticker_lessons": 3,
     # LLM settings
     "llm_provider": "openai",
     "deep_think_llm": "gpt-5.5",

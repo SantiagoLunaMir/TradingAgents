@@ -249,22 +249,30 @@ class TradingAgentsGraph:
         return benchmark_map.get("", "SPY")
 
     def _fetch_returns(
-        self, ticker: str, trade_date: str, holding_days: int = 5,
+        self, ticker: str, trade_date: str, holding_days: int | None = None,
         benchmark: str = "SPY",
     ) -> tuple[float | None, float | None, int | None]:
         """Fetch raw and alpha return for ticker over holding_days from trade_date.
 
-        ``benchmark`` is the index used as the alpha baseline (resolved by the
-        caller via ``_resolve_benchmark``). Returns ``(raw_return, alpha_return,
-        holding_days)`` or ``(None, None, None)`` when the outcome cannot be
-        settled yet: the full holding window has not traded (#1169), or the
-        symbol is delisted or unreachable.
+        ``holding_days`` defaults to ``config["memory_holding_days"]`` (5 when
+        unset). ``benchmark`` is the index used as the alpha baseline (resolved
+        by the caller via ``_resolve_benchmark``). Returns ``(raw_return,
+        alpha_return, holding_days)`` or ``(None, None, None)`` when the
+        outcome cannot be settled yet: the full holding window has not traded
+        (#1169), or the symbol is delisted or unreachable.
         """
         from tradingagents.dataflows.symbol_utils import normalize_symbol
 
+        if holding_days is None:
+            holding_days = int((getattr(self, "config", None) or {}).get(
+                "memory_holding_days", 5))
+
         try:
             start = datetime.strptime(trade_date, "%Y-%m-%d")
-            end = start + timedelta(days=holding_days + 7)  # buffer for weekends/holidays
+            # Calendar buffer for weekends/holidays. It has to grow with the
+            # window: a flat +7 days holds only ~19 sessions, so a 20-session
+            # horizon could never fill and every entry would stay pending.
+            end = start + timedelta(days=int(holding_days * 1.5) + 7)
             end_str = end.strftime("%Y-%m-%d")
 
             # Normalize so the realized-return lookup hits the same instrument
@@ -423,7 +431,11 @@ class TradingAgentsGraph:
         """Execute the graph and write the resulting state to disk and memory log."""
         # Initialize state — inject memory log context for PM and the
         # deterministically resolved instrument identity for all agents.
-        past_context = self.memory_log.get_past_context(company_name)
+        past_context = self.memory_log.get_past_context(
+            company_name,
+            n_same=int(self.config.get("memory_same_ticker_entries", 5)),
+            n_cross=int(self.config.get("memory_cross_ticker_lessons", 3)),
+        )
         instrument_context = self.resolve_instrument_context(company_name, asset_type)
         init_agent_state = self.propagator.create_initial_state(
             company_name,
