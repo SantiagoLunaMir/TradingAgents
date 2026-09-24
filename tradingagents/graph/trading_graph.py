@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import yfinance as yf
 from langgraph.prebuilt import ToolNode
 
@@ -60,6 +61,71 @@ def _coerce_max_retries(value):
     if n < 0:
         raise ValueError(f"llm_max_retries must be >= 0, got {n}")
     return n
+
+
+def _configured_holding_days(config: dict | None) -> int:
+    """``config["memory_holding_days"]``, or upstream's 5 when unset."""
+    return int((config or {}).get("memory_holding_days", 5))
+
+
+def _history_end(trade_date: str, holding_days: int) -> str:
+    """Exclusive end date for a price fetch that must cover ``holding_days``
+    sessions from ``trade_date``.
+
+    The calendar buffer for weekends/holidays has to grow with the window: a
+    flat +7 days holds only ~19 sessions, so a 20-session horizon could never
+    fill and every entry would stay pending.
+    """
+    start = datetime.strptime(trade_date, "%Y-%m-%d")
+    return (start + timedelta(days=int(holding_days * 1.5) + 7)).strftime("%Y-%m-%d")
+
+
+def _session_keys(df: pd.DataFrame) -> pd.Index:
+    """Calendar date of each row of a yfinance frame (timezone dropped), or
+    the row position for a frame without a DatetimeIndex."""
+    idx = df.index
+    if isinstance(idx, pd.DatetimeIndex):
+        if idx.tz is not None:
+            idx = idx.tz_localize(None)
+        return idx.normalize()
+    return pd.RangeIndex(len(df))
+
+
+def _from_date(df: pd.DataFrame, trade_date: str) -> pd.DataFrame:
+    """Rows on or after ``trade_date`` (a no-op without a DatetimeIndex)."""
+    if isinstance(df.index, pd.DatetimeIndex):
+        return df[_session_keys(df) >= pd.Timestamp(trade_date)]
+    return df
+
+
+def _window_return(
+    stock: pd.DataFrame, bench: pd.DataFrame, holding_days: int,
+) -> tuple[float, float] | None:
+    """Raw stock and benchmark returns over the benchmark's first
+    ``holding_days`` sessions, or None when that window has not fully traded
+    in both series (#1169).
+
+    The window is counted on the benchmark's sessions and the stock is read
+    at those dates (its last close on or before the window's end), not by row
+    position: a thin name with a missing bar would otherwise end its window on
+    a later date than the benchmark's and the alpha would compare two
+    different periods.
+    """
+    if stock.empty or len(bench) <= holding_days:
+        return None
+    bench_keys = _session_keys(bench)
+    start_key, end_key = bench_keys[0], bench_keys[holding_days]
+    stock_close = pd.Series(stock["Close"].to_numpy(), index=_session_keys(stock))
+    if stock_close.index[-1] < end_key:
+        return None
+    entry = stock_close[stock_close.index >= start_key].iloc[0]
+    exit_ = stock_close[stock_close.index <= end_key].iloc[-1]
+    bench_close = bench["Close"]
+    raw = float((exit_ - entry) / entry)
+    bench_ret = float(
+        (bench_close.iloc[holding_days] - bench_close.iloc[0]) / bench_close.iloc[0]
+    )
+    return raw, bench_ret
 
 
 class TradingAgentsGraph:
@@ -250,59 +316,63 @@ class TradingAgentsGraph:
 
     def _fetch_returns(
         self, ticker: str, trade_date: str, holding_days: int | None = None,
-        benchmark: str = "SPY",
+        benchmark: str = "SPY", stock_history: pd.DataFrame | None = None,
+        bench_history: pd.DataFrame | None = None,
     ) -> tuple[float | None, float | None, int | None]:
         """Fetch raw and alpha return for ticker over holding_days from trade_date.
 
         ``holding_days`` defaults to ``config["memory_holding_days"]`` (5 when
         unset). ``benchmark`` is the index used as the alpha baseline (resolved
-        by the caller via ``_resolve_benchmark``). Returns ``(raw_return,
-        alpha_return, holding_days)`` or ``(None, None, None)`` when the
-        outcome cannot be settled yet: the full holding window has not traded
-        (#1169), or the symbol is delisted or unreachable.
+        by the caller via ``_resolve_benchmark``). ``stock_history`` /
+        ``bench_history`` are price frames the caller already fetched over a
+        span that starts on or before ``trade_date`` (see
+        ``_resolve_pending_entries``); either one left as None is fetched here.
+        Returns ``(raw_return, alpha_return, holding_days)`` or
+        ``(None, None, None)`` when the outcome cannot be settled yet: the full
+        holding window has not traded (#1169), or the symbol is delisted or
+        unreachable.
         """
         from tradingagents.dataflows.symbol_utils import normalize_symbol
 
         if holding_days is None:
-            holding_days = int((getattr(self, "config", None) or {}).get(
-                "memory_holding_days", 5))
+            holding_days = _configured_holding_days(getattr(self, "config", None))
 
         try:
-            start = datetime.strptime(trade_date, "%Y-%m-%d")
-            # Calendar buffer for weekends/holidays. It has to grow with the
-            # window: a flat +7 days holds only ~19 sessions, so a 20-session
-            # horizon could never fill and every entry would stay pending.
-            end = start + timedelta(days=int(holding_days * 1.5) + 7)
-            end_str = end.strftime("%Y-%m-%d")
-
-            # Normalize so the realized-return lookup hits the same instrument
-            # the analysis priced (e.g. XAUUSD -> GC=F) (#984). The benchmark is
-            # already a canonical Yahoo symbol from ``_resolve_benchmark``.
-            stock = yf.Ticker(normalize_symbol(ticker)).history(start=trade_date, end=end_str)
-            bench = yf.Ticker(benchmark).history(start=trade_date, end=end_str)
+            if stock_history is None or bench_history is None:
+                end_str = _history_end(trade_date, holding_days)
+                # Normalize so the realized-return lookup hits the same
+                # instrument the analysis priced (e.g. XAUUSD -> GC=F) (#984).
+                # The benchmark is already a canonical Yahoo symbol from
+                # ``_resolve_benchmark``.
+                if stock_history is None:
+                    stock_history = yf.Ticker(normalize_symbol(ticker)).history(
+                        start=trade_date, end=end_str)
+                if bench_history is None:
+                    bench_history = yf.Ticker(benchmark).history(
+                        start=trade_date, end=end_str)
 
             # Require the full holding window in both series. A rerun before it
             # has traded leaves the entry pending to retry next run, rather than
             # settling on a premature partial return (#1169).
-            if len(stock) <= holding_days or len(bench) <= holding_days:
+            window = _window_return(
+                _from_date(stock_history, trade_date),
+                _from_date(bench_history, trade_date),
+                holding_days,
+            )
+            if window is None:
                 return None, None, None
-
-            raw = float(
-                (stock["Close"].iloc[holding_days] - stock["Close"].iloc[0])
-                / stock["Close"].iloc[0]
-            )
-            bench_ret = float(
-                (bench["Close"].iloc[holding_days] - bench["Close"].iloc[0])
-                / bench["Close"].iloc[0]
-            )
-            alpha = raw - bench_ret
-            return raw, alpha, holding_days
+            raw, bench_ret = window
+            return raw, raw - bench_ret, holding_days
         except Exception as e:
             logger.warning(
                 "Could not resolve outcome for %s on %s vs %s (will retry next run): %s",
                 ticker, trade_date, benchmark, e,
             )
             return None, None, None
+
+    def _price_history(self, symbol: str, start: str, end: str) -> pd.DataFrame:
+        """Daily yfinance history for ``symbol`` over ``[start, end)``."""
+        return yf.Ticker(symbol).history(start=start, end=end)
 
     def _resolve_pending_entries(self, ticker: str) -> None:
         """Resolve pending log entries for ticker at the start of a new run.
@@ -311,18 +381,41 @@ class TradingAgentsGraph:
         then writes all updates in a single atomic batch write to avoid redundant I/O.
         Skips entries whose price data is not yet available (too recent or delisted).
 
+        The stock and benchmark histories are fetched once, over the span from
+        the oldest pending date to the newest one's full window, and sliced per
+        entry: a longer horizon keeps more entries pending at once, and fetching
+        both series again for every one of them multiplied the yfinance calls
+        made before each run. If that fetch fails, each entry falls back to
+        fetching its own window.
+
         Trade-off: only same-ticker entries are resolved per run.  Entries for
         other tickers accumulate until that ticker is run again.
         """
+        from tradingagents.dataflows.symbol_utils import normalize_symbol
+
         pending = [e for e in self.memory_log.get_pending_entries() if e["ticker"] == ticker]
         if not pending:
             return
 
         benchmark = self._resolve_benchmark(ticker)
+        holding_days = _configured_holding_days(getattr(self, "config", None))
+        try:
+            dates = [e["date"] for e in pending]
+            start, end = min(dates), _history_end(max(dates), holding_days)
+            stock_history = self._price_history(normalize_symbol(ticker), start, end)
+            bench_history = self._price_history(benchmark, start, end)
+        except Exception as e:
+            logger.warning(
+                "Could not prefetch prices for %s vs %s, fetching per entry: %s",
+                ticker, benchmark, e,
+            )
+            stock_history = bench_history = None
+
         updates = []
         for entry in pending:
             raw, alpha, days = self._fetch_returns(
-                ticker, entry["date"], benchmark=benchmark,
+                ticker, entry["date"], holding_days=holding_days, benchmark=benchmark,
+                stock_history=stock_history, bench_history=bench_history,
             )
             if raw is None:
                 continue  # price not available yet — try again next run
@@ -331,6 +424,7 @@ class TradingAgentsGraph:
                 raw_return=raw,
                 alpha_return=alpha,
                 benchmark_name=benchmark,
+                holding_days=days,
             )
             updates.append({
                 "ticker": ticker,

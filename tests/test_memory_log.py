@@ -1,5 +1,6 @@
 """Tests for TradingMemoryLog — storage, deferred reflection, PM injection, legacy removal."""
 
+from functools import partial
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -607,6 +608,54 @@ class TestDeferredReflection:
                 mock_graph, "NVDA", "2026-01-05", holding_days=5)
         assert days == 5
 
+    # window counted on the benchmark's sessions, not by row position
+
+    def test_fetch_returns_aligns_a_missing_stock_bar_by_date(self):
+        """A thin name missing a bar must end its window on the benchmark's
+        date, not one session later."""
+        sessions = pd.bdate_range("2026-01-05", periods=8, tz="America/New_York")
+        bench = pd.DataFrame({"Close": [400.0] * 8}, index=sessions)
+        # no bar on session 2; session 5 (the window's end) closes at 110
+        stock = pd.DataFrame(
+            {"Close": [100.0, 101.0, 103.0, 104.0, 110.0, 200.0, 201.0]},
+            index=sessions.delete(2),
+        )
+        mock_graph = MagicMock(spec=TradingAgentsGraph)
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            def _make_ticker(sym):
+                m = MagicMock()
+                m.history.return_value = bench if sym == "SPY" else stock
+                return m
+            mock_ticker_cls.side_effect = _make_ticker
+            raw, alpha, days = TradingAgentsGraph._fetch_returns(
+                mock_graph, "NVDA", "2026-01-05", holding_days=5)
+        assert days == 5
+        assert raw == pytest.approx(0.10)      # 100 -> 110, not 100 -> 200
+        assert alpha == pytest.approx(0.10)
+
+    def test_fetch_returns_stays_pending_until_the_stock_trades_the_window_end(self):
+        sessions = pd.bdate_range("2026-01-05", periods=6)
+        bench = pd.DataFrame({"Close": [400.0] * 6}, index=sessions)
+        stock = pd.DataFrame({"Close": [100.0] * 5}, index=sessions[:5])
+        mock_graph = MagicMock(spec=TradingAgentsGraph)
+        result = TradingAgentsGraph._fetch_returns(
+            mock_graph, "NVDA", "2026-01-05", holding_days=5,
+            stock_history=stock, bench_history=bench)
+        assert result == (None, None, None)
+
+    def test_fetch_returns_slices_prefetched_history_from_the_trade_date(self):
+        sessions = pd.bdate_range("2026-01-05", periods=12)
+        bench = pd.DataFrame({"Close": [400.0] * 12}, index=sessions)
+        stock = pd.DataFrame({"Close": [100.0 + i for i in range(12)]}, index=sessions)
+        mock_graph = MagicMock(spec=TradingAgentsGraph)
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            raw, _, days = TradingAgentsGraph._fetch_returns(
+                mock_graph, "NVDA", str(sessions[3].date()), holding_days=5,
+                stock_history=stock, bench_history=bench)
+        mock_ticker_cls.assert_not_called()
+        assert days == 5
+        assert raw == pytest.approx((108.0 - 103.0) / 103.0)
+
     def test_default_config_keeps_upstream_reflection_behaviour(self):
         from tradingagents.default_config import DEFAULT_CONFIG
 
@@ -717,6 +766,28 @@ class TestDeferredReflection:
         assert "Alpha vs ^N225:" in human_content
         assert "Alpha vs SPY:" not in human_content
 
+    def test_reflector_states_the_holding_period(self):
+        """The model grading the call is told the window the returns cover."""
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value.content = "ok"
+        Reflector(mock_llm).reflect_on_final_decision(
+            final_decision=DECISION_BUY, raw_return=0.05, alpha_return=0.02,
+            holding_days=20,
+        )
+        messages = mock_llm.invoke.call_args[0][0]
+        human_content = next(content for role, content in messages if role == "human")
+        assert "Holding period: 20 trading sessions" in human_content
+
+    def test_reflector_omits_the_holding_period_for_unupdated_callers(self):
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value.content = "ok"
+        Reflector(mock_llm).reflect_on_final_decision(
+            final_decision=DECISION_BUY, raw_return=0.05, alpha_return=0.02,
+        )
+        messages = mock_llm.invoke.call_args[0][0]
+        human_content = next(content for role, content in messages if role == "human")
+        assert "Holding period" not in human_content
+
     def test_reflector_defaults_to_spy_for_unupdated_callers(self):
         """Default benchmark_name keeps the SPY label for legacy callers."""
         mock_llm = MagicMock()
@@ -776,6 +847,51 @@ class TestDeferredReflection:
         TradingAgentsGraph._resolve_pending_entries(mock_graph, "NVDA")
         assert len(log.get_pending_entries()) == 1  # still pending
         mock_reflector.reflect_on_final_decision.assert_not_called()
+
+    def test_resolve_fetches_each_series_once_for_many_pending_entries(self, tmp_path):
+        """A long horizon keeps many entries pending: the stock and the
+        benchmark are fetched once per resolve, not once per entry."""
+        log = make_log(tmp_path)
+        sessions = pd.bdate_range("2026-01-05", periods=40)
+        for d in sessions[:4]:
+            log.store_decision("NVDA", str(d.date()), DECISION_BUY)
+        mock_reflector = MagicMock()
+        mock_reflector.reflect_on_final_decision.return_value = "ok"
+        mock_graph = MagicMock(spec=TradingAgentsGraph)
+        mock_graph.memory_log = log
+        mock_graph.reflector = mock_reflector
+        mock_graph.config = {"memory_holding_days": 20}
+        mock_graph._resolve_benchmark.return_value = "SPY"
+        mock_graph._fetch_returns = partial(TradingAgentsGraph._fetch_returns, mock_graph)
+        mock_graph._price_history = partial(TradingAgentsGraph._price_history, mock_graph)
+        with patch("yfinance.Ticker") as mock_ticker_cls:
+            def _make_ticker(sym):
+                m = MagicMock()
+                m.history.return_value = pd.DataFrame(
+                    {"Close": [400.0 if sym == "SPY" else 100.0 + i for i in range(40)]},
+                    index=sessions)
+                return m
+            mock_ticker_cls.side_effect = _make_ticker
+            TradingAgentsGraph._resolve_pending_entries(mock_graph, "NVDA")
+        assert [c.args[0] for c in mock_ticker_cls.call_args_list] == ["NVDA", "SPY"]
+        assert log.get_pending_entries() == []
+        assert mock_reflector.reflect_on_final_decision.call_count == 4
+        for call in mock_reflector.reflect_on_final_decision.call_args_list:
+            assert call.kwargs["holding_days"] == 20
+
+    def test_resolve_falls_back_to_per_entry_fetch_when_prefetch_fails(self, tmp_path):
+        log = make_log(tmp_path)
+        log.store_decision("NVDA", "2026-01-05", DECISION_BUY)
+        mock_graph = MagicMock(spec=TradingAgentsGraph)
+        mock_graph.memory_log = log
+        mock_graph.reflector = MagicMock()
+        mock_graph._resolve_benchmark.return_value = "SPY"
+        mock_graph._price_history.side_effect = RuntimeError("yahoo down")
+        mock_graph._fetch_returns = MagicMock(return_value=(None, None, None))
+        TradingAgentsGraph._resolve_pending_entries(mock_graph, "NVDA")
+        kwargs = mock_graph._fetch_returns.call_args.kwargs
+        assert kwargs["stock_history"] is None and kwargs["bench_history"] is None
+        assert len(log.get_pending_entries()) == 1
 
 
 # ---------------------------------------------------------------------------

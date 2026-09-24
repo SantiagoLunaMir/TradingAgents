@@ -34,6 +34,7 @@ class Reflector:
         raw_return: float,
         alpha_return: float,
         benchmark_name: str = "SPY",
+        holding_days: int | None = None,
     ) -> str:
         """Single reflection call on the final trade decision with outcome context.
 
@@ -42,12 +43,20 @@ class Reflector:
         ``benchmark_name`` is the label used for the alpha line (e.g. ``"SPY"``
         for US tickers, ``"^N225"`` for ``.T`` listings); defaults to SPY for
         callers that haven't been updated to thread the benchmark through.
+        ``holding_days`` states the window the returns cover: the same +4%
+        teaches a different lesson over 5 sessions than over 20, and without it
+        the model cannot tell which horizon it is grading.
         """
+        horizon = (
+            f"Holding period: {holding_days} trading sessions after the decision\n"
+            if holding_days else ""
+        )
         messages = [
             ("system", self.log_reflection_prompt),
             (
                 "human",
                 (
+                    f"{horizon}"
                     f"Raw return: {raw_return:+.1%}\n"
                     f"Alpha vs {benchmark_name}: {alpha_return:+.1%}\n\n"
                     f"Final Decision:\n{final_decision}"
