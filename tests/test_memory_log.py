@@ -1140,10 +1140,11 @@ class TestConcurrentWriters:
             for t in workers:
                 t.start()
             for t in workers:
-                t.join()
+                t.join(timeout=60)
         finally:
             sys.setswitchinterval(old_interval)
 
+        assert not any(t.is_alive() for t in workers), "writer deadlocked"
         assert errors == []
         entries = make_log(tmp_path).load_entries()
         assert {e["reflection"] for e in entries} == {
@@ -1151,3 +1152,18 @@ class TestConcurrentWriters:
         }
         assert all(not e["pending"] for e in entries)
         assert not list(tmp_path.glob("*.tmp"))
+
+    def test_batch_update_without_match_does_not_rewrite(self, tmp_path):
+        """An update whose entry is already resolved leaves the file alone."""
+        log = make_log(tmp_path)
+        _resolve_entry(log, "NVDA", "2026-01-10", DECISION_BUY)
+        path = tmp_path / "trading_memory.md"
+        before = path.stat().st_mtime_ns
+        with patch.object(log, "_atomic_write") as write:
+            log.batch_update_with_outcomes([{
+                "ticker": "NVDA", "trade_date": "2026-01-10",
+                "raw_return": 0.0, "alpha_return": 0.0, "holding_days": 5,
+                "reflection": "late duplicate",
+            }])
+        write.assert_not_called()
+        assert path.stat().st_mtime_ns == before

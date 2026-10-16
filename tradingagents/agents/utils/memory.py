@@ -207,6 +207,7 @@ class TradingMemoryLog:
 
         # Build lookup keyed by (trade_date, ticker) for O(1) dispatch
         update_map = {(u["trade_date"], u["ticker"]): u for u in updates}
+        requested = len(update_map)
 
         new_blocks = []
         for block in blocks:
@@ -241,6 +242,11 @@ class TradingMemoryLog:
             if not matched:
                 new_blocks.append(block)
 
+        if len(update_map) == requested:
+            # Nothing still pending (e.g. another graph resolved it first):
+            # skip rewriting the whole log.
+            return
+
         new_blocks = self._apply_rotation(new_blocks)
         self._atomic_write(self._SEPARATOR.join(new_blocks))
 
@@ -254,6 +260,10 @@ class TradingMemoryLog:
         sidecar file covers separate processes (POSIX only). The sidecar is
         locked rather than the log itself because os.replace() swaps the
         log's inode out from under any lock held on it.
+
+        Not re-entrant: a nested call would flock a second file description
+        and deadlock on POSIX, so the ``*_locked`` helpers must never call
+        a method that takes this lock again.
         """
         with _LOG_LOCK:
             if fcntl is None:
