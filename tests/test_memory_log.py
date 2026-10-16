@@ -426,13 +426,15 @@ class TestDeferredReflection:
         assert msft["ticker"] == "MSFT" and msft["pending"] is True
 
     def test_update_atomic_write(self, tmp_path):
-        """A pre-existing .tmp file is overwritten; the log is correctly updated."""
+        """Writes go through a unique temp file: a stale .tmp is never reused
+        and the update leaves no temp file of its own behind."""
         log = make_log(tmp_path)
         log.store_decision("NVDA", "2026-01-10", DECISION_BUY)
         stale_tmp = tmp_path / "trading_memory.tmp"
-        stale_tmp.write_text("GARBAGE CONTENT — should be overwritten", encoding="utf-8")
+        stale_tmp.write_text("GARBAGE CONTENT", encoding="utf-8")
         log.update_with_outcome("NVDA", "2026-01-10", 0.042, 0.021, 5, "Correct.")
-        assert not stale_tmp.exists()
+        assert stale_tmp.read_text(encoding="utf-8") == "GARBAGE CONTENT"
+        assert sorted(p.name for p in tmp_path.glob("*.tmp")) == ["trading_memory.tmp"]
         entries = log.load_entries()
         assert len(entries) == 1
         assert entries[0]["reflection"] == "Correct."
@@ -1097,3 +1099,71 @@ class TestLegacyRemoval:
         assert len(entries) == 1
         assert entries[0]["ticker"] == "NVDA"
         assert entries[0]["pending"] is True
+
+
+# ---------------------------------------------------------------------------
+# Concurrent writers sharing one log
+# ---------------------------------------------------------------------------
+
+class TestConcurrentWriters:
+    def test_threads_sharing_a_log_lose_nothing(self, tmp_path):
+        """Graphs run on parallel threads share one log. Each store + resolve
+        must survive: no temp-file race, no rewrite clobbering another
+        writer's reflection or pending append."""
+        import sys
+        import threading
+
+        threads_n, rounds = 6, 15
+        errors = []
+        start = threading.Barrier(threads_n)
+
+        def worker(i):
+            log = make_log(tmp_path)
+            ticker = f"T{i}"
+            try:
+                start.wait()
+                for k in range(rounds):
+                    date = f"2026-01-{k + 1:02d}"
+                    log.store_decision(ticker, date, DECISION_BUY)
+                    log.batch_update_with_outcomes([{
+                        "ticker": ticker, "trade_date": date,
+                        "raw_return": 0.01, "alpha_return": 0.0,
+                        "holding_days": 5, "reflection": f"{ticker} {k}",
+                    }])
+            except BaseException as exc:
+                errors.append(exc)
+
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            workers = [threading.Thread(target=worker, args=(i,)) for i in range(threads_n)]
+            for t in workers:
+                t.start()
+            for t in workers:
+                t.join(timeout=60)
+        finally:
+            sys.setswitchinterval(old_interval)
+
+        assert not any(t.is_alive() for t in workers), "writer deadlocked"
+        assert errors == []
+        entries = make_log(tmp_path).load_entries()
+        assert {e["reflection"] for e in entries} == {
+            f"T{i} {k}" for i in range(threads_n) for k in range(rounds)
+        }
+        assert all(not e["pending"] for e in entries)
+        assert not list(tmp_path.glob("*.tmp"))
+
+    def test_batch_update_without_match_does_not_rewrite(self, tmp_path):
+        """An update whose entry is already resolved leaves the file alone."""
+        log = make_log(tmp_path)
+        _resolve_entry(log, "NVDA", "2026-01-10", DECISION_BUY)
+        path = tmp_path / "trading_memory.md"
+        before = path.stat().st_mtime_ns
+        with patch.object(log, "_atomic_write") as write:
+            log.batch_update_with_outcomes([{
+                "ticker": "NVDA", "trade_date": "2026-01-10",
+                "raw_return": 0.0, "alpha_return": 0.0, "holding_days": 5,
+                "reflection": "late duplicate",
+            }])
+        write.assert_not_called()
+        assert path.stat().st_mtime_ns == before

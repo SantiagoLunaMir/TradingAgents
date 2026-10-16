@@ -1,9 +1,25 @@
 """Append-only markdown decision log for TradingAgents."""
 
+import contextlib
+import os
 import re
+import tempfile
+import threading
 from pathlib import Path
 
 from tradingagents.agents.utils.rating import parse_rating
+
+try:  # POSIX only; on Windows the in-process lock is the only guard
+    import fcntl
+except ImportError:  # pragma: no cover - platform dependent
+    fcntl = None
+
+
+# Serialises every read-modify-write of a log file within this process. Several
+# graphs can share one log (e.g. analyses fanned out over threads); without it,
+# two rewrites race and the later os.replace() silently drops the earlier
+# writer's reflections, or an append lands on the replaced (orphaned) file.
+_LOG_LOCK = threading.RLock()
 
 
 class TradingMemoryLog:
@@ -36,17 +52,20 @@ class TradingMemoryLog:
         """Append pending entry at end of propagate(). No LLM call."""
         if not self._log_path:
             return
-        # Idempotency guard: fast raw-text scan instead of full parse
-        if self._log_path.exists():
-            raw = self._log_path.read_text(encoding="utf-8")
-            for line in raw.splitlines():
-                if line.startswith(f"[{trade_date} | {ticker} |") and line.endswith("| pending]"):
-                    return
         rating = parse_rating(final_trade_decision)
         tag = f"[{trade_date} | {ticker} | {rating} | pending]"
         entry = f"{tag}\n\nDECISION:\n{final_trade_decision}{self._SEPARATOR}"
-        with open(self._log_path, "a", encoding="utf-8") as f:
-            f.write(entry)
+        # Locked so the append can't land on a file another writer is about
+        # to replace (it would vanish with the old inode).
+        with self._locked():
+            # Idempotency guard: fast raw-text scan instead of full parse
+            if self._log_path.exists():
+                raw = self._log_path.read_text(encoding="utf-8")
+                for line in raw.splitlines():
+                    if line.startswith(f"[{trade_date} | {ticker} |") and line.endswith("| pending]"):
+                        return
+            with open(self._log_path, "a", encoding="utf-8") as f:
+                f.write(entry)
 
     # --- Read path (Phase A) ---
 
@@ -111,7 +130,17 @@ class TradingMemoryLog:
         its tag with return figures, and appends a REFLECTION section.  Uses
         a temp-file + os.replace() so a crash mid-write never corrupts the log.
         """
-        if not self._log_path or not self._log_path.exists():
+        if not self._log_path:
+            return
+        with self._locked():
+            self._update_with_outcome_locked(
+                ticker, trade_date, raw_return, alpha_return, holding_days, reflection
+            )
+
+    def _update_with_outcome_locked(
+        self, ticker, trade_date, raw_return, alpha_return, holding_days, reflection
+    ) -> None:
+        if not self._log_path.exists():
             return
 
         text = self._log_path.read_text(encoding="utf-8")
@@ -156,10 +185,7 @@ class TradingMemoryLog:
             return
 
         new_blocks = self._apply_rotation(new_blocks)
-        new_text = self._SEPARATOR.join(new_blocks)
-        tmp_path = self._log_path.with_suffix(".tmp")
-        tmp_path.write_text(new_text, encoding="utf-8")
-        tmp_path.replace(self._log_path)
+        self._atomic_write(self._SEPARATOR.join(new_blocks))
 
     def batch_update_with_outcomes(self, updates: list[dict]) -> None:
         """Apply multiple outcome updates in a single read + atomic write.
@@ -167,7 +193,13 @@ class TradingMemoryLog:
         Each element of updates must have keys: ticker, trade_date,
         raw_return, alpha_return, holding_days, reflection.
         """
-        if not self._log_path or not self._log_path.exists() or not updates:
+        if not self._log_path or not updates:
+            return
+        with self._locked():
+            self._batch_update_locked(updates)
+
+    def _batch_update_locked(self, updates: list[dict]) -> None:
+        if not self._log_path.exists():
             return
 
         text = self._log_path.read_text(encoding="utf-8")
@@ -175,6 +207,7 @@ class TradingMemoryLog:
 
         # Build lookup keyed by (trade_date, ticker) for O(1) dispatch
         update_map = {(u["trade_date"], u["ticker"]): u for u in updates}
+        requested = len(update_map)
 
         new_blocks = []
         for block in blocks:
@@ -209,13 +242,61 @@ class TradingMemoryLog:
             if not matched:
                 new_blocks.append(block)
 
+        if len(update_map) == requested:
+            # Nothing still pending (e.g. another graph resolved it first):
+            # skip rewriting the whole log.
+            return
+
         new_blocks = self._apply_rotation(new_blocks)
-        new_text = self._SEPARATOR.join(new_blocks)
-        tmp_path = self._log_path.with_suffix(".tmp")
-        tmp_path.write_text(new_text, encoding="utf-8")
-        tmp_path.replace(self._log_path)
+        self._atomic_write(self._SEPARATOR.join(new_blocks))
 
     # --- Helpers ---
+
+    @contextlib.contextmanager
+    def _locked(self):
+        """Exclusive access to the log for a whole read-modify-write.
+
+        The thread lock covers graphs sharing a process; the flock on a
+        sidecar file covers separate processes (POSIX only). The sidecar is
+        locked rather than the log itself because os.replace() swaps the
+        log's inode out from under any lock held on it.
+
+        Not re-entrant: a nested call would flock a second file description
+        and deadlock on POSIX, so the ``*_locked`` helpers must never call
+        a method that takes this lock again.
+        """
+        with _LOG_LOCK:
+            if fcntl is None:
+                yield
+                return
+            lock_path = self._log_path.with_name(self._log_path.name + ".lock")
+            with open(lock_path, "a") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _atomic_write(self, text: str) -> None:
+        """Write via a uniquely named temp file + os.replace().
+
+        A crash mid-write never corrupts the log, and no two writers can
+        share (and steal) a temp file the way a fixed ``.tmp`` name allowed.
+        """
+        fd, tmp_name = tempfile.mkstemp(
+            dir=self._log_path.parent, prefix=self._log_path.name + ".", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            # mkstemp creates 0600; keep the log's existing permissions
+            with contextlib.suppress(OSError):
+                os.chmod(tmp_name, self._log_path.stat().st_mode & 0o777)
+            os.replace(tmp_name, self._log_path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
+            raise
 
     def _apply_rotation(self, blocks: list[str]) -> list[str]:
         """Drop oldest resolved blocks when their count exceeds max_entries.
